@@ -12,6 +12,7 @@
 #include "hires.h"
 #include "hook.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ---- fm.exe 7.0.2 addresses -----------------------------------------------------------------
@@ -24,6 +25,7 @@
 
 #define ADDR_DRAW_STRING        0x00EE1E90 // FONT::draw_string(surf,x,y,&col,&outline,str,hit_cb)
 #define ADDR_SET_FONT_SIZE      0x00EE1270 // FONT::select(style{.,flags}, size_x, size_y)
+#define ADDR_MEASURE_STRING     0x00EE2530 // FONT::measure(str, all_advances) -> px, thiscall ret 8
 #define ADDR_T2K_SET_TRANSFORM  0x00F05090 // cdecl (scaler, 0, xdpi, ydpi, int matrix[4], 1, &err)
 #define ADDR_FILL_RECT          0x00DFDB50 // IMAGE_BASE::fill_rect(rect, colour, alpha)
 #define ADDR_BLIT_ALPHA         0x00DFCB00 // IMAGE_BASE::blit_alpha(x, y, src, alpha)
@@ -54,6 +56,12 @@ static const BYTE SIG_BLIT_COPY[] = { 0x83, 0xEC, 0x1C, 0x53, 0x56, 0x8B, 0x74, 
 #define FONT_FLAGS   0x1C // style flags; part of the glyph cache key
 #define FONT_SIZE_X  0x20
 #define FONT_SIZE_Y  0x21
+#define FONT_GLYPHS  0x28 // GLYPH** sorted cache
+#define FONT_NGLYPHS 0x2C
+// GLYPH (cache entry), DWORD indices
+#define GLYPH_ADVANCE_X 6 // 16.16 pen advance
+#define GLYPH_CHAR      8
+#define GLYPH_KEY       9 // flags<<16 | size_y<<8 | size_x
 
 // Style flag bits unused by the renderer; set during the hi-res pass so its glyphs get their
 // own cache entries (key = flags<<16 | size_y<<8 | size_x). Bits 10..14 = zoom generation.
@@ -69,6 +77,7 @@ typedef short(__fastcall *vf_short_t)(void *self, void *edx);
 typedef char(__fastcall *vf_char_t)(void *self, void *edx);
 typedef void(__fastcall *vf_get_colour_t)(void *self, void *edx, DWORD *colour);
 typedef DWORD *(__fastcall *vf_pixel_ptr_t)(void *self, void *edx, short *pt, short *pitch);
+typedef short(__fastcall *measure_string_t)(void **font, void *edx, void *str, int all_advances);
 typedef void(__fastcall *set_font_size_t)(void **font, void *edx, void *style, int sx, int sy);
 typedef int(__cdecl *t2k_set_transform_t)(void *scaler, int a, int xdpi, int ydpi, int *matrix,
 	int b, void *err);
@@ -84,6 +93,7 @@ static blit_alpha_t orig_blit_alpha;
 static blit_copy_t orig_blit_copy;
 static const lock_rect_t win_lock_rect = (lock_rect_t)ADDR_WIN_LOCK_RECT;
 static const set_font_size_t set_font_size = (set_font_size_t)ADDR_SET_FONT_SIZE;
+static const measure_string_t measure_string = (measure_string_t)ADDR_MEASURE_STRING;
 
 // ---- shadow buffer state --------------------------------------------------------------------
 
@@ -165,12 +175,123 @@ void hires_on_back_buffer(BYTE *win, int pw, int ph, int lw, int lh)
 
 // ---- fallback: upscale a logical rect into the shadow buffer ---------------------------------
 
+// ---- parallel rows --------------------------------------------------------------------------------
+// Our own scaling work (it only reads finished game pixels and writes our shadow buffer or cache) is
+// split by rows across a small worker pool while the calling (game main) thread waits. No game code
+// or game data is touched from the workers.
+
+#define MAX_WORKERS 8
+#define PARALLEL_MIN_PIXELS 32768 // smaller jobs run inline
+
+typedef void (*rows_fn)(void *ctx, int y0, int y1);
+static struct {
+	rows_fn fn;
+	void *ctx;
+	int bounds[MAX_WORKERS + 2];
+} g_job;
+static HANDLE g_start[MAX_WORKERS + 1], g_done;
+static volatile LONG g_pool_pending;
+static int g_workers = -1; // -1 = not started
+
+static DWORD WINAPI worker(LPVOID arg)
+{
+	int i = (int)(INT_PTR)arg;
+	for (;;) {
+		WaitForSingleObject(g_start[i], INFINITE);
+		g_job.fn(g_job.ctx, g_job.bounds[i], g_job.bounds[i + 1]);
+		if (InterlockedDecrement(&g_pool_pending) == 0)
+			SetEvent(g_done);
+	}
+}
+
+static void pool_start(void)
+{
+	SYSTEM_INFO si;
+	int i, n;
+	GetSystemInfo(&si);
+	n = (int)si.dwNumberOfProcessors - 1;
+	if (n > MAX_WORKERS)
+		n = MAX_WORKERS;
+	g_workers = 0;
+	if (n <= 0)
+		return;
+	g_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+	for (i = 1; i <= n; i++) {
+		g_start[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+		CloseHandle(CreateThread(NULL, 0, worker, (LPVOID)(INT_PTR)i, 0, NULL));
+	}
+	g_workers = n;
+	logf_("hires: %d scaling worker threads", n);
+}
+
+// Run fn over rows [y0, y1) split into chunks; returns when all are done. Main thread only.
+static void parallel_rows(int y0, int y1, int width, rows_fn fn, void *ctx)
+{
+	int rows = y1 - y0, chunks, i;
+	if (g_workers < 0)
+		pool_start();
+	chunks = g_workers + 1;
+	if (chunks > rows / 4)
+		chunks = rows / 4;
+	if (chunks < 2 || (long long)rows * width < PARALLEL_MIN_PIXELS) {
+		fn(ctx, y0, y1);
+		return;
+	}
+	g_job.fn = fn;
+	g_job.ctx = ctx;
+	for (i = 0; i <= chunks; i++)
+		g_job.bounds[i] = y0 + (int)((long long)rows * i / chunks);
+	g_pool_pending = chunks - 1;
+	for (i = 1; i < chunks; i++)
+		SetEvent(g_start[i]);
+	fn(ctx, g_job.bounds[0], g_job.bounds[1]);
+	WaitForSingleObject(g_done, INFINITE);
+}
+
+typedef struct {
+	const DWORD *src;
+	int pitch, lw, lh, x0, x1;
+	const int *col_i, *col_w;
+} UPSCALE_JOB;
+
+static void upscale_rows(void *ctx, int y0, int y1)
+{
+	const UPSCALE_JOB *j = (const UPSCALE_JOB *)ctx;
+	int py, px;
+	for (py = y0; py < y1; py++) {
+		double f = (py + 0.5) / g_zy - 0.5;
+		int jr = (int)floor(f);
+		int wy = (int)((f - jr) * 256.0);
+		const DWORD *r0, *r1;
+		DWORD *dst = g_bits + (size_t)py * g_pw;
+		if (jr < 0) { jr = 0; wy = 0; }
+		if (jr >= j->lh - 1) { jr = j->lh - 1; wy = 0; }
+		if (!g_smooth)
+			wy = wy >= 128 ? 256 : 0;
+		r0 = j->src + (size_t)jr * j->pitch;
+		r1 = wy ? r0 + j->pitch : r0;
+		for (px = j->x0; px < j->x1; px++) {
+			int i = j->col_i[px - j->x0], wx = j->col_w[px - j->x0];
+			DWORD a = r0[i], b = wx ? r0[i + 1] : a, c = r1[i], d = wx ? r1[i + 1] : c;
+			DWORD ix = 256 - wx, iy = 256 - wy;
+			// weighted sums two channels at a time (lanes 16 bits apart; max 255*256 fits)
+			DWORD rb0 = ((a & 0xFF00FF) * ix + (b & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+			DWORD ga0 = ((a >> 8 & 0xFF00FF) * ix + (b >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+			DWORD rb1 = ((c & 0xFF00FF) * ix + (d & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+			DWORD ga1 = ((c >> 8 & 0xFF00FF) * ix + (d >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+			DWORD rb = (rb0 * iy + rb1 * wy) >> 8 & 0xFF00FF;
+			DWORD ga = (ga0 * iy + ga1 * wy) >> 8 & 0xFF00FF;
+			dst[px] = rb | ga << 8;
+		}
+	}
+}
+
 static void upscale(int x, int y, int w, int h)
 {
 	const DWORD *src = *(DWORD **)(g_win + WIN_BITS);
 	int pitch = *(short *)(g_win + WIN_PITCH);
 	int lw = *(short *)(g_win + WIN_BB_W), lh = *(short *)(g_win + WIN_BB_H);
-	int x0, x1, y0, y1, px, py;
+	int x0, x1, y0, y1, px;
 	static int col_i[8192], col_w[8192];
 
 	if (!src || lw != g_lw || lh != g_lh)
@@ -198,31 +319,11 @@ static void upscale(int x, int y, int w, int h)
 		col_i[px - x0] = i;
 		col_w[px - x0] = g_smooth ? wt : (wt >= 128 ? 256 : 0);
 	}
-	for (py = y0; py < y1; py++) {
-		double f = (py + 0.5) / g_zy - 0.5;
-		int j = (int)floor(f);
-		int wy = (int)((f - j) * 256.0);
-		const DWORD *r0, *r1;
-		DWORD *dst = g_bits + (size_t)py * g_pw;
-		if (j < 0) { j = 0; wy = 0; }
-		if (j >= lh - 1) { j = lh - 1; wy = 0; }
-		if (!g_smooth)
-			wy = wy >= 128 ? 256 : 0;
-		r0 = src + (size_t)j * pitch;
-		r1 = wy ? r0 + pitch : r0;
-		for (px = x0; px < x1; px++) {
-			int i = col_i[px - x0], wx = col_w[px - x0];
-			DWORD a = r0[i], b = wx ? r0[i + 1] : a, c = r1[i], d = wx ? r1[i + 1] : c;
-			DWORD ix = 256 - wx, iy = 256 - wy;
-			// weighted sums two channels at a time (lanes 16 bits apart; max 255*256 fits)
-			DWORD rb0 = ((a & 0xFF00FF) * ix + (b & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
-			DWORD ga0 = ((a >> 8 & 0xFF00FF) * ix + (b >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
-			DWORD rb1 = ((c & 0xFF00FF) * ix + (d & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
-			DWORD ga1 = ((c >> 8 & 0xFF00FF) * ix + (d >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
-			DWORD rb = (rb0 * iy + rb1 * wy) >> 8 & 0xFF00FF;
-			DWORD ga = (ga0 * iy + ga1 * wy) >> 8 & 0xFF00FF;
-			dst[px] = rb | ga << 8;
-		}
+	{
+		UPSCALE_JOB j;
+		j.src = src; j.pitch = pitch; j.lw = lw; j.lh = lh; j.x0 = x0; j.x1 = x1;
+		j.col_i = col_i; j.col_w = col_w;
+		parallel_rows(y0, y1, x1 - x0, upscale_rows, &j);
 	}
 }
 
@@ -318,6 +419,57 @@ static int __cdecl hk_t2k_set_transform(void *scaler, int a, int xdpi, int ydpi,
 	return r;
 }
 
+// Make every hi-res glyph advance exactly zoom x its logical twin (same key without the hi-res tag
+// bits, same character), so natively rasterised text keeps the game's layout - hinting otherwise
+// makes it a little wider and line ends get clipped. The logical glyphs of a string are in the
+// cache after the logical pass, the hi-res ones after measure_string in the hi-res pass. Matching
+// by full key also covers shadow/outline styles, which draw with temporarily altered flags.
+#define KEY_TAG_MASK 0xFC000000u // flags bits 10..15 (HIRES_TAG + zoom generation) << 16
+static void match_advances(BYTE *f)
+{
+	enum { SLOTS = 4096 };
+	static DWORD skey[SLOTS], sadv[SLOTS];
+	static WORD schar[SLOTS], sgen[SLOTS];
+	static WORD gen;
+	DWORD **g = *(DWORD ***)(f + FONT_GLYPHS);
+	DWORD tag_bits = (g_tag << 16) & KEY_TAG_MASK;
+	int n = *(int *)(f + FONT_NGLYPHS), i;
+	if (!g || n <= 0)
+		return;
+	if (++gen == 0) {
+		memset(sgen, 0, sizeof sgen);
+		gen = 1;
+	}
+	for (i = 0; i < n; i++) {
+		DWORD key, h;
+		WORD c;
+		if (!g[i] || (g[i][GLYPH_KEY] & KEY_TAG_MASK))
+			continue;
+		key = g[i][GLYPH_KEY];
+		c = (WORD)g[i][GLYPH_CHAR];
+		for (h = (key * 2654435761u ^ c) % SLOTS; sgen[h] == gen && (skey[h] != key || schar[h] != c);
+			 h = (h + 1) % SLOTS)
+			;
+		skey[h] = key;
+		schar[h] = c;
+		sadv[h] = g[i][GLYPH_ADVANCE_X];
+		sgen[h] = gen;
+	}
+	for (i = 0; i < n; i++) {
+		DWORD key, h;
+		WORD c;
+		if (!g[i] || (g[i][GLYPH_KEY] & KEY_TAG_MASK) != tag_bits)
+			continue;
+		key = g[i][GLYPH_KEY] & ~KEY_TAG_MASK;
+		c = (WORD)g[i][GLYPH_CHAR];
+		for (h = (key * 2654435761u ^ c) % SLOTS; sgen[h] == gen; h = (h + 1) % SLOTS)
+			if (skey[h] == key && schar[h] == c) {
+				g[i][GLYPH_ADVANCE_X] = (DWORD)(int)floor((int)sadv[h] * g_zx + 0.5);
+				break;
+			}
+	}
+}
+
 static void __fastcall hk_draw_string(void **font, void *edx, BYTE *surf, int x, int y,
 	DWORD *colour, DWORD *outline, void *str, void *hit_cb)
 {
@@ -354,6 +506,8 @@ static void __fastcall hk_draw_string(void **font, void *edx, BYTE *surf, int x,
 	set_font_size(font, NULL, &style, sx, sy);
 	g_tscale = 1.0;
 	*(DWORD *)(f + FONT_FLAGS) = flags | g_tag;
+	measure_string(font, NULL, str, 1); // loads every hi-res glyph of the string into the cache
+	match_advances(f);
 
 	proxy_from_window(surf);
 	ox = *(short *)(surf + SURF_ORIGIN);
@@ -363,6 +517,7 @@ static void __fastcall hk_draw_string(void **font, void *edx, BYTE *surf, int x,
 	g_hx0 = sx_((short)x + ox) - g_proxy.origin[0];
 	g_hy0 = sy_((short)y + oy) - g_proxy.origin[1];
 	orig_draw_string(font, edx, (BYTE *)&g_proxy, g_hx0, g_hy0, colour, outline, str, NULL);
+	match_advances(f); // styled variants (shadow/outline flags) were first created by the draw
 
 	// 3. restore the logical font transform
 	*(DWORD *)(f + FONT_FLAGS) = flags;
@@ -443,17 +598,136 @@ static void shadow_fill(int x0, int y0, int x1, int y1, DWORD colour, DWORD a)
 
 // ---- images ----------------------------------------------------------------------------------
 
+// Bilinear blend of four pixels, two 8-bit channels per 32-bit lane (weights 0..256).
+static __forceinline DWORD bilerp(DWORD a, DWORD b, DWORD c, DWORD d, DWORD wx, DWORD wy)
+{
+	DWORD ix = 256 - wx, iy = 256 - wy;
+	DWORD rb0 = ((a & 0xFF00FF) * ix + (b & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+	DWORD ga0 = ((a >> 8 & 0xFF00FF) * ix + (b >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+	DWORD rb1 = ((c & 0xFF00FF) * ix + (d & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+	DWORD ga1 = ((c >> 8 & 0xFF00FF) * ix + (d >> 8 & 0xFF00FF) * wx) >> 8 & 0xFF00FF;
+	return ((rb0 * iy + rb1 * wy) >> 8 & 0xFF00FF) | ((ga0 * iy + ga1 * wy) >> 8 & 0xFF00FF) << 8;
+}
+
+// Premultiply a straight-alpha pixel (alpha kept in the top byte).
+static __forceinline DWORD premul(DWORD c)
+{
+	DWORD a = c >> 24;
+	if (a == 255)
+		return c;
+	if (!a)
+		return 0;
+	return ((c & 0xFF00FF) * a >> 8 & 0xFF00FF) | ((c & 0xFF00) * a >> 8 & 0xFF00) | (c & 0xFF000000);
+}
+
+typedef struct {
+	const DWORD *base;
+	int pitch, sw, sh, ax, ay;
+	BOOL premultiply; // alpha blits interpolate premultiplied colour (no dark fringes)
+} SCALE_SRC;
+
+static int g_col_i[8192], g_col_w[8192];
+
+// Column tables for physical columns [px0, px1).
+static void scale_cols(const SCALE_SRC *s, int px0, int px1)
+{
+	int px;
+	for (px = px0; px < px1; px++) {
+		double f = (px + 0.5) / g_zx - 0.5 - s->ax;
+		int i = (int)floor(f), wt = (int)((f - i) * 256.0);
+		if (i < 0) { i = 0; wt = 0; }
+		if (i >= s->sw - 1) { i = s->sw - 1; wt = 0; }
+		g_col_i[px - px0] = i;
+		g_col_w[px - px0] = wt;
+	}
+}
+
+// One physical row py of the scaled source over [px0, px1) (scale_cols(px0, px1) first).
+static void scale_row(const SCALE_SRC *s, int py, int px0, int px1, DWORD *out)
+{
+	double f = (py + 0.5) / g_zy - 0.5 - s->ay;
+	int j = (int)floor(f), wy = (int)((f - j) * 256.0), n = px1 - px0, k;
+	const DWORD *r0, *r1;
+	if (j < 0) { j = 0; wy = 0; }
+	if (j >= s->sh - 1) { j = s->sh - 1; wy = 0; }
+	r0 = s->base + (size_t)j * s->pitch;
+	r1 = wy ? r0 + s->pitch : r0;
+	for (k = 0; k < n; k++) {
+		int i = g_col_i[k], wx = g_col_w[k];
+		DWORD a = r0[i], b = wx ? r0[i + 1] : a, c = r1[i], d = wx ? r1[i + 1] : c;
+		if (s->premultiply && ((a & b & c & d) >> 24) != 255) {
+			if (!((a | b | c | d) >> 24)) {
+				out[k] = 0;
+				continue;
+			}
+			a = premul(a); b = premul(b); c = premul(c); d = premul(d);
+		}
+		out[k] = bilerp(a, b, c, d, wx, wy);
+	}
+}
+
+// Write n scaled pixels onto the shadow buffer: copy, or premultiplied "over" with galpha.
+static void composite_row(DWORD *dst, const DWORD *src, int n, BOOL blend, DWORD galpha)
+{
+	int k;
+	if (!blend) {
+		for (k = 0; k < n; k++)
+			dst[k] = src[k] | 0xFF000000;
+		return;
+	}
+	for (k = 0; k < n; k++) {
+		DWORD s = src[k], a, inv, p, da;
+		if (galpha != 255)
+			s = ((s & 0xFF00FF) * galpha >> 8 & 0xFF00FF) | ((s >> 8 & 0xFF00FF) * galpha >> 8 & 0xFF00FF) << 8;
+		a = s >> 24;
+		if (a == 255) {
+			dst[k] = s;
+			continue;
+		}
+		if (!a)
+			continue;
+		inv = 255 - a;
+		inv += inv >> 7; // 0..256
+		p = dst[k];
+		da = p >> 24;
+		p = (((p & 0xFF00FF) * inv >> 8 & 0xFF00FF) + (s & 0xFF00FF)) |
+			(((p >> 8 & 0xFF00FF) * inv >> 8 & 0xFF00FF) + (s >> 8 & 0xFF00FF)) << 8;
+		dst[k] = (p & 0x00FFFFFF) | (da > a ? da : a) << 24;
+	}
+}
+
+// Images are scaled directly on every draw, split across the worker pool. (A cache of scaled
+// images was tried: verifying it - a full checksum per draw, since sampled checks can miss small
+// changes such as commentary text - cost more than rescaling, and stale entries showed old content.)
+typedef struct {
+	const SCALE_SRC *s;
+	int x0, x1;
+	BOOL blend;
+	DWORD galpha;
+} IMAGE_JOB;
+
+static void image_rows_direct(void *ctx, int y0, int y1)
+{
+	const IMAGE_JOB *j = (const IMAGE_JOB *)ctx;
+	DWORD row[8192]; // per thread
+	int py;
+	for (py = y0; py < y1; py++) {
+		scale_row(j->s, py, j->x0, j->x1, row);
+		composite_row(g_bits + (size_t)py * g_pw + j->x0, row, j->x1 - j->x0, j->blend, j->galpha);
+	}
+}
+
 // Redraw src (an IMAGE_BASE) at logical local (x,y) of the window into the shadow buffer,
-// sampling it bilinearly at physical resolution. blend: per-pixel alpha "over" like the game's
-// MMX blit (0x00EABC40), with premultiplied interpolation to avoid dark fringes.
+// sampled bilinearly at physical resolution. blend: per-pixel alpha "over" like the game's MMX
+// blit (0x00EABC40), interpolating premultiplied colour so edges get no dark fringes.
 static void shadow_image(BYTE *dst, int x, int y, BYTE *src, DWORD galpha, BOOL blend)
 {
 	void **vt = *(void ***)src;
 	int sw = ((vf_short_t)vt[0x14 / 4])(src, NULL), sh = ((vf_short_t)vt[0x18 / 4])(src, NULL);
 	short rect[4], pt[4], pitch;
-	int x0, y0, x1, y1, px, py, ax, ay;
-	const DWORD *base;
-	static int col_i[8192], col_w[8192];
+	int x0, y0, x1, y1;
+	SCALE_SRC s;
+	IMAGE_JOB j;
 
 	if (sw <= 0 || sh <= 0)
 		return;
@@ -473,67 +747,19 @@ static void shadow_image(BYTE *dst, int x, int y, BYTE *src, DWORD galpha, BOOL 
 	pt[1] = *(short *)(src + SURF_ORIGIN + 2);
 	pt[2] = (short)sw;
 	pt[3] = (short)sh;
-	base = ((vf_pixel_ptr_t)vt[0x2C / 4])(src, NULL, pt, &pitch);
-	if (!base || x1 - x0 > 8192)
+	s.base = ((vf_pixel_ptr_t)vt[0x2C / 4])(src, NULL, pt, &pitch);
+	if (!s.base || x1 - x0 > 8192)
 		return;
+	s.pitch = pitch;
+	s.sw = sw;
+	s.sh = sh;
+	s.ax = x + *(short *)(dst + SURF_ORIGIN);
+	s.ay = y + *(short *)(dst + SURF_ORIGIN + 2);
+	s.premultiply = blend;
 
-	ax = x + *(short *)(dst + SURF_ORIGIN);
-	ay = y + *(short *)(dst + SURF_ORIGIN + 2);
-	for (px = x0; px < x1; px++) {
-		double f = (px + 0.5) / g_zx - 0.5 - ax;
-		int i = (int)floor(f), wt = (int)((f - i) * 256.0);
-		if (i < 0) { i = 0; wt = 0; }
-		if (i >= sw - 1) { i = sw - 1; wt = 0; }
-		col_i[px - x0] = i;
-		col_w[px - x0] = wt;
-	}
-	for (py = y0; py < y1; py++) {
-		double f = (py + 0.5) / g_zy - 0.5 - ay;
-		int j = (int)floor(f), wy = (int)((f - j) * 256.0);
-		const DWORD *r0, *r1;
-		DWORD *d = g_bits + (size_t)py * g_pw;
-		if (j < 0) { j = 0; wy = 0; }
-		if (j >= sh - 1) { j = sh - 1; wy = 0; }
-		r0 = base + (size_t)j * pitch;
-		r1 = wy ? r0 + pitch : r0;
-		for (px = x0; px < x1; px++) {
-			int i = col_i[px - x0], wx = col_w[px - x0];
-			DWORD s[4];
-			int k, ch;
-			unsigned wts[4];
-			unsigned acc[4] = { 0, 0, 0, 0 }; // premultiplied b, g, r and alpha, scaled by 65536
-			s[0] = r0[i]; s[1] = wx ? r0[i + 1] : s[0];
-			s[2] = r1[i]; s[3] = wx ? r1[i + 1] : s[2];
-			wts[0] = (256 - wx) * (256 - wy); wts[1] = wx * (256 - wy);
-			wts[2] = (256 - wx) * wy; wts[3] = wx * wy;
-			for (k = 0; k < 4; k++) {
-				unsigned a = blend ? s[k] >> 24 : 255;
-				unsigned wa = wts[k] * a / 255; // weight * alpha
-				acc[3] += wts[k] * a;
-				for (ch = 0; ch < 3; ch++)
-					acc[ch] += wa * (s[k] >> (8 * ch) & 0xFF);
-			}
-			if (!blend) {
-				d[px] = (acc[0] >> 16) | (acc[1] >> 16) << 8 | (acc[2] >> 16) << 16 | 0xFF000000;
-			}
-			else {
-				unsigned a = (acc[3] >> 16) * galpha / 255; // coverage 0..255
-				DWORD p = d[px], out = 0;
-				unsigned da, na;
-				if (!a)
-					continue;
-				for (ch = 0; ch < 3; ch++) {
-					unsigned dc = p >> (8 * ch) & 0xFF;
-					unsigned sc = (acc[ch] >> 16) * galpha / 255; // premultiplied source
-					unsigned v = sc + dc * (255 - a) / 255;
-					out |= (v > 255 ? 255 : v) << (8 * ch);
-				}
-				da = p >> 24;
-				na = da > a ? da : a;
-				d[px] = out | na << 24;
-			}
-		}
-	}
+	scale_cols(&s, x0, x1);
+	j.s = &s; j.x0 = x0; j.x1 = x1; j.blend = blend; j.galpha = galpha;
+	parallel_rows(y0, y1, x1 - x0, image_rows_direct, &j);
 }
 
 static void __fastcall hk_blit_alpha(BYTE *dst, void *edx, int x, int y, BYTE *src, int alpha)
@@ -664,8 +890,16 @@ static BOOL write_bmp(const WCHAR *path, const DWORD *bits, int w, int h, int pi
 
 BOOL hires_dump(const WCHAR *path, BYTE *win)
 {
-	if (g_on)
+	if (g_on) {
+		// also the game's own logical frame, to tell replay bugs from game behaviour
+		WCHAR logical[MAX_PATH];
+		lstrcpynW(logical, path, MAX_PATH - 12);
+		lstrcatW(logical, L".logical.bmp");
+		if (win && *(DWORD **)(win + WIN_BITS))
+			write_bmp(logical, *(DWORD **)(win + WIN_BITS), *(short *)(win + WIN_BB_W),
+				*(short *)(win + WIN_BB_H), *(short *)(win + WIN_PITCH));
 		return write_bmp(path, g_bits, g_pw, g_ph, g_pw);
+	}
 	if (!win || !*(DWORD **)(win + WIN_BITS))
 		return FALSE;
 	return write_bmp(path, *(DWORD **)(win + WIN_BITS), *(short *)(win + WIN_BB_W),

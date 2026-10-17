@@ -75,6 +75,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR args, int show)
 			return 1;
 		}
 	}
+	// optional: run a different fm.exe (e.g. a Large Address Aware copy) with game_dir as cwd
+	{
+		WCHAR alt[MAX_PATH];
+		GetPrivateProfileStringW(L"launcher", L"exe", L"", alt, MAX_PATH, ini);
+		if (alt[0] && exists(alt))
+			lstrcpyW(exe, alt);
+	}
 	wsprintfW(cmd, L"\"%s\" %s", exe, args ? args : L"");
 
 	inject = !proxy_installed(game_dir);

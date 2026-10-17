@@ -11,7 +11,7 @@ rem a running game keeps fm07mod.dll locked, but a loaded DLL can still be renam
 if exist bin\fm07mod.dll.old del bin\fm07mod.dll.old 2>nul
 if exist bin\fm07mod.dll move /y bin\fm07mod.dll bin\fm07mod.dll.old >nul
 set CFLAGS=/nologo /O2 /W4 /MT /GS- /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /Foobj\
-cl %CFLAGS% /LD src\fm07mod.c src\hook.c src\hires.c src\proxy.c /Fe:bin\fm07mod.dll /link /DEF:src\fm07mod.def user32.lib gdi32.lib || exit /b 1
+cl %CFLAGS% /LD src\fm07mod.c src\hook.c src\hires.c src\perf.c src\proxy.c /Fe:bin\fm07mod.dll /link /MAP:obj\fm07mod.map /DEF:src\fm07mod.def user32.lib gdi32.lib || exit /b 1
 cl %CFLAGS% src\launcher.c /Fe:bin\fm07launch.exe /link /SUBSYSTEM:WINDOWS user32.lib || exit /b 1
 if not exist bin\fm07mod.ini copy fm07mod.ini bin\ >nul
 

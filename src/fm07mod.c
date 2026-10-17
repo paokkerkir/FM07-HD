@@ -21,6 +21,7 @@
 #include <math.h>
 #include "hook.h"
 #include "hires.h"
+#include "perf.h"
 
 // ---- fm.exe 7.0.2 addresses -------------------------------------------------------------
 
@@ -67,7 +68,9 @@ static struct {
 	BOOL start_maximized;
 	BOOL dpi_aware;
 	BOOL hires;         // render text natively at physical resolution
+	BOOL fast_file_io;  // perf.c: direct fread/fwrite in the engine FILE wrapper
 	int min_lw, min_lh; // smallest logical size the UI is allowed to get; 0 = game's own minimum
+	int max_lw, max_lh; // largest logical size; -1 = unlimited (default), 0 = game's own maximum
 	int mode;           // MODE_* applied to the first window open
 	BOOL exclusive_fullscreen; // 0 = fullscreen is a borderless window at desktop resolution
 } cfg;
@@ -124,8 +127,11 @@ static void load_config(void)
 	cfg.start_maximized = GetPrivateProfileIntW(L"display", L"start_maximized", 0, ini);
 	cfg.dpi_aware = GetPrivateProfileIntW(L"display", L"dpi_aware", 1, ini);
 	cfg.hires = GetPrivateProfileIntW(L"display", L"hires_text", 1, ini);
+	cfg.fast_file_io = GetPrivateProfileIntW(L"performance", L"fast_file_io", 1, ini);
 	cfg.min_lw = GetPrivateProfileIntW(L"display", L"min_logical_width", 0, ini);
 	cfg.min_lh = GetPrivateProfileIntW(L"display", L"min_logical_height", 0, ini);
+	cfg.max_lw = GetPrivateProfileIntW(L"display", L"max_logical_width", -1, ini);
+	cfg.max_lh = GetPrivateProfileIntW(L"display", L"max_logical_height", -1, ini);
 	cfg.exclusive_fullscreen = GetPrivateProfileIntW(L"display", L"exclusive_fullscreen", 0, ini);
 	{
 		WCHAR mode[32];
@@ -221,18 +227,38 @@ static void restore_placement(HWND hwnd)
 	SetWindowPlacement(hwnd, &wpl);
 }
 
-// Zoom actually used for a physical client size: never lets the logical UI drop below the
-// configured minimum, never below 1.
+// Zoom range for a physical client size. Lower bound: the logical UI must not exceed the game's
+// designed maximum (1600x1200 in 7.0.2) - beyond it layouts break, e.g. match banners tile.
+// Upper bound: it must not drop below the minimum (1024x768) - the game then forces fullscreen.
+// The minimum wins if both cannot hold (very wide screens).
+static void zoom_range(int pw, int ph, double *lo, double *hi)
+{
+	*lo = 1.0;
+	*hi = 4.0;
+	if (cfg.max_lw > 0 && (double)pw / cfg.max_lw > *lo)
+		*lo = (double)pw / cfg.max_lw;
+	if (cfg.max_lh > 0 && (double)ph / cfg.max_lh > *lo)
+		*lo = (double)ph / cfg.max_lh;
+	if (cfg.min_lw > 0 && (double)pw / cfg.min_lw < *hi)
+		*hi = (double)pw / cfg.min_lw;
+	if (cfg.min_lh > 0 && (double)ph / cfg.min_lh < *hi)
+		*hi = (double)ph / cfg.min_lh;
+	if (*hi < 1.0)
+		*hi = 1.0;
+	if (*lo > *hi)
+		*lo = *hi;
+}
+
+// Zoom actually used for a physical client size: the requested zoom, kept inside zoom_range.
 static double effective_zoom(int pw, int ph)
 {
-	double z = g_zoom;
-	double zmax_w = cfg.min_lw > 0 ? (double)pw / cfg.min_lw : z;
-	double zmax_h = cfg.min_lh > 0 ? (double)ph / cfg.min_lh : z;
-	if (z > zmax_w)
-		z = zmax_w;
-	if (z > zmax_h)
-		z = zmax_h;
-	return z < 1.0 ? 1.0 : z;
+	double lo, hi, z = g_zoom;
+	zoom_range(pw, ph, &lo, &hi);
+	if (z < lo)
+		z = lo;
+	if (z > hi)
+		z = hi;
+	return z;
 }
 
 static BOOL zoomed(void)
@@ -273,6 +299,11 @@ static short __fastcall hk_open_window(void *self, void *edx, void *title, int i
 			cfg.min_lw = (short)min_w > 0 ? (short)min_w : 1024;
 		if (cfg.min_lh <= 0)
 			cfg.min_lh = (short)min_h > 0 ? (short)min_h : 768;
+		// the game's own maximum, before we unlock the window size below
+		if (cfg.max_lw == 0)
+			cfg.max_lw = (short)max_w > 0 ? (short)max_w : 1600;
+		if (cfg.max_lh == 0)
+			cfg.max_lh = (short)max_h > 0 ? (short)max_h : 1200;
 		// Window mode is only forced on the first open so the in-game toggle keeps working.
 		// Flag 8 = restore saved placement (which also restores the saved fullscreen state).
 		if (cfg.mode == MODE_WINDOWED)
@@ -285,7 +316,7 @@ static short __fastcall hk_open_window(void *self, void *edx, void *title, int i
 			w = cfg.window_w;
 			h = cfg.window_h;
 		}
-		modlog("zoom %.2f, min logical %dx%d", g_zoom, cfg.min_lw, cfg.min_lh);
+		modlog("zoom %.2f, logical size %dx%d .. %dx%d", g_zoom, cfg.min_lw, cfg.min_lh, cfg.max_lw, cfg.max_lh);
 	}
 	// Unlock the window size: the game's spec caps it at 1600x1200. Any max >= 0 also makes
 	// the platform open choose the resizable WS_OVERLAPPEDWINDOW style.
@@ -416,23 +447,28 @@ static void __fastcall hk_present(BYTE *self, void *edx, HDC hdc)
 static void apply_zoom(HWND hwnd, double z)
 {
 	RECT cr;
-	double zmax = 4.0;
+	double lo, hi;
 	GetClientRect(hwnd, &cr);
-	// Beyond what the window can show (UI must stay >= min logical size) further steps would
-	// change nothing visible and make zooming back out feel stuck, so clamp here.
-	if (cfg.min_lw > 0 && cr.right / (double)cfg.min_lw < zmax)
-		zmax = cr.right / (double)cfg.min_lw;
-	if (cfg.min_lh > 0 && cr.bottom / (double)cfg.min_lh < zmax)
-		zmax = cr.bottom / (double)cfg.min_lh;
-	if (z > zmax)
-		z = zmax;
-	if (z < 1.0)
-		z = 1.0;
+	// Outside what this window allows nothing would change visibly and zooming back would feel
+	// stuck, so clamp the request to the window's zoom range.
+	zoom_range(cr.right, cr.bottom, &lo, &hi);
+	if (z > hi)
+		z = hi;
+	if (z < lo)
+		z = lo;
 	g_zoom = z;
 	modlog("hotkey zoom %.2f", z);
 	save_zoom();
-	// The game's WM_SIZE handler rebuilds the back buffer (via our hook) and re-lays out.
-	SendMessageW(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(cr.right, cr.bottom));
+	// The game's WM_SIZE handler rebuilds the back buffer (via our hook) and re-lays out. It ignores
+	// WM_SIZE while its fullscreen flag is set, so lift the flag for this one message (borderless
+	// fullscreen keeps the window covering the monitor, so the client size is unchanged).
+	{
+		volatile char *fs = (volatile char *)ADDR_FULLSCREEN_ACTIVE;
+		char saved = *fs;
+		*fs = 0;
+		SendMessageW(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(cr.right, cr.bottom));
+		*fs = saved;
+	}
 	InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -567,6 +603,8 @@ static void install_all(void)
 	install("present", ADDR_PRESENT, SIG_PRESENT, sizeof SIG_PRESENT, (void *)hk_present, 5, NULL);
 	if (cfg.hires)
 		hires_install(modlog, cfg.smooth);
+	if (cfg.fast_file_io)
+		perf_install(modlog);
 	if (!cfg.exclusive_fullscreen) {
 		// the slot is in .data (writable); it normally holds the lazy unicows resolver stub
 		*(void **)ADDR_PTR_CHANGE_DISPLAY_SETTINGS_W = (void *)fake_change_display_settings;
