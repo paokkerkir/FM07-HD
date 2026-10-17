@@ -1,0 +1,16 @@
+; Exports for fm07mod.dll / dsound.dll (same binary). Ordinals match the system dsound.dll;
+; fm.exe imports ordinal 1.
+EXPORTS
+	DirectSoundCreate=fwd_DirectSoundCreate                       @1
+	DirectSoundEnumerateA=fwd_DirectSoundEnumerateA               @2
+	DirectSoundEnumerateW=fwd_DirectSoundEnumerateW               @3
+	DllCanUnloadNow=fwd_DllCanUnloadNow                           PRIVATE
+	DllGetClassObject=fwd_DllGetClassObject                       PRIVATE
+	DirectSoundCaptureCreate=fwd_DirectSoundCaptureCreate         @6
+	DirectSoundCaptureEnumerateA=fwd_DirectSoundCaptureEnumerateA @7
+	DirectSoundCaptureEnumerateW=fwd_DirectSoundCaptureEnumerateW @8
+	GetDeviceID=fwd_GetDeviceID                                   @9
+	DirectSoundFullDuplexCreate=fwd_DirectSoundFullDuplexCreate   @10
+	DirectSoundCreate8=fwd_DirectSoundCreate8                     @11
+	DirectSoundCaptureCreate8=fwd_DirectSoundCaptureCreate8       @12
+	fm07mod_version                                               @100
