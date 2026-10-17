@@ -13,6 +13,13 @@ Copy **`dsound.dll`** and **`fm07mod.ini`** into the Football Manager 2007 folde
 
 To uninstall, delete `dsound.dll` (and `fm07mod.ini`).
 
+## Optional: match banner fix for large windows
+
+FM2007 sizes the foul/card/offside banner over the 2D pitch as 3/5 of the pitch width; on wider
+windows its graphics tile (the banner) appears 2-3 times. `data\panels\match notification.xml`
+here gives it its designed fixed width (486) centred. Copy it over the game's
+`data\panels\match notification.xml` (keep a backup of the original).
+
 
 ## Use
 
