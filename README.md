@@ -1,4 +1,4 @@
-# FM07HD — display mod for Football Manager 2007 (7.0.2)
+# FM07HD - display mod for Football Manager 2007 (7.0.2)
 
 Window size options, freely resizable/maximisable window (no more 1600x1200 cap), borderless
 fullscreen, and UI scaling zoom up to 4x with text, boxes and images drawn sharply at full resolution.
