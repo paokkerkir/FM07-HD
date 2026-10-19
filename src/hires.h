@@ -4,8 +4,9 @@
 #pragma once
 #include <windows.h>
 
-// Install vtable patches and text hooks. Returns FALSE if any signature check fails.
-BOOL hires_install(void (*log)(const char *fmt, ...), BOOL smooth);
+// Install vtable patches and text hooks (always: they also brand the version string). enable = use
+// the hi-res shadow buffer. Returns FALSE if any signature check fails.
+BOOL hires_install(void (*log)(const char *fmt, ...), BOOL smooth, BOOL enable);
 
 // Called after the game (re)created its logical back buffer. win = SI_WINDOW_PLATFORM.
 void hires_on_back_buffer(BYTE *win, int pw, int ph, int lw, int lh);

@@ -13,6 +13,7 @@
 #include "hook.h"
 #include <math.h>
 #include <stdlib.h>
+#include <intrin.h>
 #include <string.h>
 
 // ---- fm.exe 7.0.2 addresses -----------------------------------------------------------------
@@ -30,13 +31,20 @@
 #define ADDR_FILL_RECT          0x00DFDB50 // IMAGE_BASE::fill_rect(rect, colour, alpha)
 #define ADDR_BLIT_ALPHA         0x00DFCB00 // IMAGE_BASE::blit_alpha(x, y, src, alpha)
 #define ADDR_BLIT_COPY          0x00DFCC30 // IMAGE_BASE::blit_copy(x, y, src)
+#define ADDR_DRAW_LINE          0x00DFB850 // IMAGE_BASE::draw_line(&p0, &p1, colour, ...), ret 0x18
+#define ADDR_TILE_IMAGE         0x00DFFD80 // IMAGE_BASE::tile(&rect, src, mode 0 copy/1 alpha), ret 0xc
+#define ADDR_SNAPSHOT           0x00DFB740 // IMAGE::copy_from(src_surface, &rect): resize + copy, ret 8
 
 static const BYTE SIG_DRAW_STRING[] = { 0x83, 0xEC, 0x68, 0x55, 0x8B, 0x29, 0x8A, 0x45, 0x00 };
+static const BYTE SIG_MEASURE_STRING[] = { 0x83, 0xEC, 0x08, 0x8B, 0x01, 0x80, 0x38, 0x00, 0x89, 0x0C, 0x24 };
 static const BYTE SIG_SET_FONT_SIZE[] = { 0x83, 0xEC, 0x38, 0x56, 0x8B, 0x31, 0x8A, 0x06 };
 static const BYTE SIG_T2K_SET_TRANSFORM[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x48, 0x8B, 0x45, 0x20 };
 static const BYTE SIG_FILL_RECT[] = { 0x83, 0xEC, 0x20, 0x8B, 0x44, 0x24, 0x24, 0x66, 0x8B, 0x50, 0x02 };
 static const BYTE SIG_BLIT_ALPHA[] = { 0x83, 0xEC, 0x1C, 0x55, 0x56, 0x8B, 0x74, 0x24, 0x30 };
 static const BYTE SIG_BLIT_COPY[] = { 0x83, 0xEC, 0x1C, 0x53, 0x56, 0x8B, 0x74, 0x24, 0x30 };
+static const BYTE SIG_DRAW_LINE[] = { 0x83, 0xEC, 0x28, 0x8B, 0x44, 0x24, 0x2C, 0x8B, 0x54, 0x24, 0x30, 0x53 };
+static const BYTE SIG_TILE_IMAGE[] = { 0x83, 0xEC, 0x38, 0x53, 0x8B, 0x5C, 0x24, 0x44, 0x8B, 0x03, 0x55, 0x56 };
+static const BYTE SIG_SNAPSHOT[] = { 0x8B, 0x44, 0x24, 0x08, 0x83, 0xEC, 0x0C, 0x53, 0x55, 0x8B, 0x6C, 0x24, 0x18 };
 
 // SI_WINDOW_PLATFORM back buffer fields
 #define WIN_BITS     0x7C
@@ -60,6 +68,7 @@ static const BYTE SIG_BLIT_COPY[] = { 0x83, 0xEC, 0x1C, 0x53, 0x56, 0x8B, 0x74, 
 #define FONT_NGLYPHS 0x2C
 // GLYPH (cache entry), DWORD indices
 #define GLYPH_ADVANCE_X 6 // 16.16 pen advance
+#define GLYPH_ADVANCE_Y 7 // 16.16 pen advance of vertical text (font flag 0x200), pen moves up
 #define GLYPH_CHAR      8
 #define GLYPH_KEY       9 // flags<<16 | size_y<<8 | size_x
 
@@ -73,6 +82,10 @@ typedef void(__fastcall *draw_string_t)(void **font, void *edx, BYTE *surf, int 
 typedef void(__fastcall *fill_rect_t)(BYTE *surf, void *edx, short *rect, DWORD colour, int alpha);
 typedef void(__fastcall *blit_alpha_t)(BYTE *dst, void *edx, int x, int y, BYTE *src, int alpha);
 typedef void(__fastcall *blit_copy_t)(BYTE *dst, void *edx, int x, int y, BYTE *src);
+typedef void(__fastcall *snapshot_t)(BYTE *img, void *edx, BYTE *src, short *rect);
+typedef void(__fastcall *tile_image_t)(BYTE *dst, void *edx, short *rect, BYTE *src, int mode);
+typedef void(__fastcall *draw_line_t)(BYTE *surf, void *edx, short *p0, short *p1, int a3, int a4,
+	int a5, int a6);
 typedef short(__fastcall *vf_short_t)(void *self, void *edx);
 typedef char(__fastcall *vf_char_t)(void *self, void *edx);
 typedef void(__fastcall *vf_get_colour_t)(void *self, void *edx, DWORD *colour);
@@ -87,10 +100,14 @@ static BOOL g_smooth;
 static BOOL g_installed;
 
 static draw_string_t orig_draw_string;
+static measure_string_t orig_measure_string;
 static t2k_set_transform_t orig_t2k_set_transform;
 static fill_rect_t orig_fill_rect;
 static blit_alpha_t orig_blit_alpha;
 static blit_copy_t orig_blit_copy;
+static draw_line_t orig_draw_line;
+static tile_image_t orig_tile_image;
+static snapshot_t orig_snapshot;
 static const lock_rect_t win_lock_rect = (lock_rect_t)ADDR_WIN_LOCK_RECT;
 static const set_font_size_t set_font_size = (set_font_size_t)ADDR_SET_FONT_SIZE;
 static const measure_string_t measure_string = (measure_string_t)ADDR_MEASURE_STRING;
@@ -335,12 +352,86 @@ static void flush_pending(void)
 	g_npending = 0;
 }
 
+// ---- diagnostics: who still goes through the fallback / draws text off-window --------------------
+// Aggregated per caller chain (first 3 return addresses into fm.exe found on the stack) and dumped
+// to the log with every capture (hires_dump).
+
+#define DIAG_SLOTS 64
+typedef struct {
+	DWORD chain[3];
+	DWORD vtable; // surface vtable (text) or 0 (fallback)
+	DWORD count;
+	double area;  // logical pixels
+} DIAG;
+static DIAG g_diag_fallback[DIAG_SLOTS], g_diag_text[DIAG_SLOTS];
+
+static BOOL is_return_address(DWORD v)
+{
+	const BYTE *b = (const BYTE *)v;
+	if (v < 0x00401007 || v >= 0x0100D000)
+		return FALSE;
+	return b[-5] == 0xE8 || (b[-6] == 0xFF && (b[-5] & 0x38) == 0x10) ||
+		(b[-3] == 0xFF && (b[-2] & 0x38) == 0x10 && (b[-2] & 0xC0) == 0x40) ||
+		(b[-2] == 0xFF && (b[-1] & 0x38) == 0x10 && (b[-1] & 0xC0) == 0xC0) ||
+		(b[-2] == 0xFF && (b[-1] & 0x38) == 0x10 && (b[-1] & 0xC0) == 0x00);
+}
+
+static void caller_chain(const DWORD *sp, DWORD out[3])
+{
+	int k, n = 0;
+	out[0] = out[1] = out[2] = 0;
+	for (k = 0; k < 96 && n < 3; k++)
+		if (is_return_address(sp[k]))
+			out[n++] = sp[k];
+}
+
+static void diag_add(DIAG *t, const DWORD chain[3], DWORD vtable, double area)
+{
+	int i, free_slot = -1;
+	for (i = 0; i < DIAG_SLOTS; i++) {
+		if (t[i].count && t[i].vtable == vtable && !memcmp(t[i].chain, chain, 12)) {
+			t[i].count++;
+			t[i].area += area;
+			return;
+		}
+		if (!t[i].count && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot >= 0) {
+		memcpy(t[free_slot].chain, chain, 12);
+		t[free_slot].vtable = vtable;
+		t[free_slot].count = 1;
+		t[free_slot].area = area;
+	}
+}
+
+static void diag_dump(const char *title, DIAG *t)
+{
+	int i, j, best;
+	logf_("diag %s (count, logical px, surface vtable, callers):", title);
+	for (j = 0; j < 12; j++) {
+		best = -1;
+		for (i = 0; i < DIAG_SLOTS; i++)
+			if (t[i].count && (best < 0 || t[i].area > t[best].area))
+				best = i;
+		if (best < 0)
+			break;
+		logf_("  %6lu %10.0f %08lx  %08lx %08lx %08lx", t[best].count, t[best].area, t[best].vtable,
+			t[best].chain[0], t[best].chain[1], t[best].chain[2]);
+		t[best].count = 0;
+	}
+	memset(t, 0, sizeof(DIAG) * DIAG_SLOTS);
+}
+
 // ---- window vtable patches -------------------------------------------------------------------
 
 static DWORD *__fastcall hk_win_lock_rect(BYTE *self, void *edx, short *rect, short *pitch)
 {
 	DWORD *p = win_lock_rect(self, edx, rect, pitch);
 	if (g_on && self == g_win && !g_suppress) {
+		DWORD chain[3];
+		caller_chain((const DWORD *)_AddressOfReturnAddress(), chain);
+		diag_add(g_diag_fallback, chain, 0, (double)rect[2] * rect[3]);
 		if (g_npending == MAX_PENDING)
 			flush_pending();
 		memcpy(g_pending[g_npending++], rect, 4 * sizeof(short));
@@ -419,7 +510,7 @@ static int __cdecl hk_t2k_set_transform(void *scaler, int a, int xdpi, int ydpi,
 	return r;
 }
 
-// Make every hi-res glyph advance exactly zoom x its logical twin (same key without the hi-res tag
+// Make every hi-res glyph advance (x, and y for vertical text) exactly zoom x its logical twin (same key without the hi-res tag
 // bits, same character), so natively rasterised text keeps the game's layout - hinting otherwise
 // makes it a little wider and line ends get clipped. The logical glyphs of a string are in the
 // cache after the logical pass, the hi-res ones after measure_string in the hi-res pass. Matching
@@ -428,7 +519,7 @@ static int __cdecl hk_t2k_set_transform(void *scaler, int a, int xdpi, int ydpi,
 static void match_advances(BYTE *f)
 {
 	enum { SLOTS = 4096 };
-	static DWORD skey[SLOTS], sadv[SLOTS];
+	static DWORD skey[SLOTS], sadv[SLOTS], sadvy[SLOTS];
 	static WORD schar[SLOTS], sgen[SLOTS];
 	static WORD gen;
 	DWORD **g = *(DWORD ***)(f + FONT_GLYPHS);
@@ -453,6 +544,7 @@ static void match_advances(BYTE *f)
 		skey[h] = key;
 		schar[h] = c;
 		sadv[h] = g[i][GLYPH_ADVANCE_X];
+		sadvy[h] = g[i][GLYPH_ADVANCE_Y];
 		sgen[h] = gen;
 	}
 	for (i = 0; i < n; i++) {
@@ -465,9 +557,45 @@ static void match_advances(BYTE *f)
 		for (h = (key * 2654435761u ^ c) % SLOTS; sgen[h] == gen; h = (h + 1) % SLOTS)
 			if (skey[h] == key && schar[h] == c) {
 				g[i][GLYPH_ADVANCE_X] = (DWORD)(int)floor((int)sadv[h] * g_zx + 0.5);
+				g[i][GLYPH_ADVANCE_Y] = (DWORD)(int)floor((int)sadvy[h] * g_zy + 0.5);
 				break;
 			}
 	}
+}
+
+// ---- branding ---------------------------------------------------------------------------------
+// The start screen shows "Version 7.0.2"; with the mod it reads "Version 7.0.2 - FM07HD v1.2". The
+// string is matched by content in draw_string and measure_string (so the label is sized for it).
+
+typedef struct {
+	DWORD pad;
+	WORD len, pad2;
+	WCHAR *chars;
+} FAKE_STR_INNER; // the game's string body: length at +4, characters at +8
+typedef struct {
+	BYTE pad[8];
+	FAKE_STR_INNER *inner;
+} FAKE_STR; // the game's string: body pointer at +8
+
+#define BRAND_ORIGINAL L"Version 7.0.2"
+static WCHAR g_brand_chars[] = L"Version 7.0.2 - FM07HD v1.2";
+static FAKE_STR_INNER g_brand_inner;
+static FAKE_STR g_brand;
+
+static void *brand(void *str)
+{
+	BYTE *inner;
+	if (!str || !(inner = *(BYTE **)((BYTE *)str + 8)))
+		return str;
+	if (*(WORD *)(inner + 4) != (sizeof BRAND_ORIGINAL / 2 - 1) || !*(WCHAR **)(inner + 8) ||
+		memcmp(*(WCHAR **)(inner + 8), BRAND_ORIGINAL, sizeof BRAND_ORIGINAL - 2))
+		return str;
+	return &g_brand;
+}
+
+static short __fastcall hk_measure_string(void **font, void *edx, void *str, int all_advances)
+{
+	return orig_measure_string(font, edx, brand(str), all_advances);
 }
 
 static void __fastcall hk_draw_string(void **font, void *edx, BYTE *surf, int x, int y,
@@ -479,12 +607,19 @@ static void __fastcall hk_draw_string(void **font, void *edx, BYTE *surf, int x,
 	struct { void *vt; DWORD flags; } style;
 	short ox, oy;
 
+	str = brand(str);
+
 	if (g_text_depth && surf == (BYTE *)&g_proxy && !hit_cb) {
 		// shadow/outline/emboss styles recurse with +-1px offsets; scale them
 		x = g_hx0 + (int)floor(((short)x - g_hx0) * g_zx + 0.5);
 		y = g_hy0 + (int)floor(((short)y - g_hy0) * g_zy + 0.5);
 	}
 	if (g_text_depth || hit_cb || !g_on || surf != g_win || !f || !f[FONT_LOADED]) {
+		if (g_on && !g_text_depth && !hit_cb && surf && surf != g_win && surf != (BYTE *)&g_proxy) {
+			DWORD chain[3];
+			caller_chain((const DWORD *)_AddressOfReturnAddress(), chain);
+			diag_add(g_diag_text, chain, *(DWORD *)surf, 1);
+		}
 		orig_draw_string(font, edx, surf, x, y, colour, outline, str, hit_cb);
 		return;
 	}
@@ -594,6 +729,132 @@ static void shadow_fill(int x0, int y0, int x1, int y1, DWORD colour, DWORD a)
 			d[x] = rb | ga << 8;
 		}
 	}
+}
+
+// ---- window snapshots ----------------------------------------------------------------------
+// Widgets such as TITLED_BOX (screen headers) copy a window area into a temporary IMAGE
+// (IMAGE::copy_from), later blit that image back to the same place and draw on top. The copy is a
+// read, but it uses the write lock, so the fallback would blur that area; and blitting the low-res
+// copy back would put blurry pixels (including old text) under the new crisp text. We keep the
+// hi-res pixels of the area with the image and restore those when the unchanged image is blitted
+// back to the same place.
+
+#define SNAP_SLOTS 8
+typedef struct {
+	BYTE *img;
+	int ax, ay, w, h;   // logical, window absolute
+	int px0, py0, pw, ph; // physical copy
+	DWORD sum;          // checksum of the image's logical pixels after the copy
+	DWORD *pixels;
+} SNAPSHOT;
+static SNAPSHOT g_snap[SNAP_SLOTS];
+static int g_snap_next;
+
+static DWORD image_sum(BYTE *img, int *w_out, int *h_out, const DWORD **base_out, int *pitch_out)
+{
+	void **vt = *(void ***)img;
+	int w = ((vf_short_t)vt[0x14 / 4])(img, NULL), h = ((vf_short_t)vt[0x18 / 4])(img, NULL), x, y;
+	short pt[4] = { 0, 0, 0, 0 }, pitch;
+	const DWORD *base;
+	DWORD sum = 2166136261u;
+	*w_out = w;
+	*h_out = h;
+	if (w <= 0 || h <= 0)
+		return 0;
+	pt[0] = *(short *)(img + SURF_ORIGIN);
+	pt[1] = *(short *)(img + SURF_ORIGIN + 2);
+	pt[2] = (short)w;
+	pt[3] = (short)h;
+	base = ((vf_pixel_ptr_t)vt[0x2C / 4])(img, NULL, pt, &pitch);
+	if (base_out)
+		*base_out = base;
+	if (pitch_out)
+		*pitch_out = pitch;
+	if (!base)
+		return 0;
+	for (y = 0; y < h; y++)
+		for (x = 0; x < w; x++)
+			sum = (sum ^ base[(size_t)y * pitch + x]) * 16777619u;
+	return sum;
+}
+
+static void __fastcall hk_snapshot(BYTE *img, void *edx, BYTE *src, short *rect)
+{
+	SNAPSHOT *sn;
+	int x0, y0, x1, y1, y, w, h;
+	if (!g_on || src != g_win || !img || !rect) {
+		orig_snapshot(img, edx, src, rect);
+		return;
+	}
+	g_suppress++; // reading the window: nothing to upscale
+	orig_snapshot(img, edx, src, rect);
+	g_suppress--;
+
+	sn = NULL;
+	for (y = 0; y < SNAP_SLOTS; y++)
+		if (g_snap[y].img == img)
+			sn = &g_snap[y];
+	if (!sn) {
+		sn = &g_snap[g_snap_next];
+		g_snap_next = (g_snap_next + 1) % SNAP_SLOTS;
+	}
+	free(sn->pixels);
+	memset(sn, 0, sizeof *sn);
+	sn->ax = rect[0] + *(short *)(src + SURF_ORIGIN);
+	sn->ay = rect[1] + *(short *)(src + SURF_ORIGIN + 2);
+	sn->w = rect[2];
+	sn->h = rect[3];
+	x0 = sx_(sn->ax); x1 = sx_(sn->ax + sn->w);
+	y0 = sy_(sn->ay); y1 = sy_(sn->ay + sn->h);
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > g_pw) x1 = g_pw;
+	if (y1 > g_ph) y1 = g_ph;
+	if (x1 <= x0 || y1 <= y0)
+		return;
+	sn->pixels = (DWORD *)malloc((size_t)(x1 - x0) * (y1 - y0) * 4);
+	if (!sn->pixels)
+		return;
+	for (y = y0; y < y1; y++)
+		memcpy(sn->pixels + (size_t)(y - y0) * (x1 - x0), g_bits + (size_t)y * g_pw + x0, (size_t)(x1 - x0) * 4);
+	sn->px0 = x0; sn->py0 = y0; sn->pw = x1 - x0; sn->ph = y1 - y0;
+	sn->sum = image_sum(img, &w, &h, NULL, NULL);
+	if (w != sn->w || h != sn->h) { // not the simple resize+copy we expect
+		free(sn->pixels);
+		sn->pixels = NULL;
+		return;
+	}
+	sn->img = img;
+}
+
+// If src is an unchanged snapshot being blitted back to where it was taken, restore our hi-res copy.
+static BOOL restore_snapshot(BYTE *dst, int x, int y, BYTE *src)
+{
+	int i, w, h, ax, ay, py, x0, x1, y0, y1;
+	SNAPSHOT *sn = NULL;
+	for (i = 0; i < SNAP_SLOTS; i++)
+		if (g_snap[i].img == src && g_snap[i].pixels)
+			sn = &g_snap[i];
+	if (!sn)
+		return FALSE;
+	ax = x + *(short *)(dst + SURF_ORIGIN);
+	ay = y + *(short *)(dst + SURF_ORIGIN + 2);
+	if (ax != sn->ax || ay != sn->ay || image_sum(src, &w, &h, NULL, NULL) != sn->sum || w != sn->w || h != sn->h)
+		return FALSE;
+	{
+		short rect[4];
+		rect[0] = (short)x; rect[1] = (short)y; rect[2] = (short)w; rect[3] = (short)h;
+		if (!map_rect(dst, rect, &x0, &y0, &x1, &y1))
+			return TRUE; // fully clipped: nothing to draw
+	}
+	if (x0 < sn->px0) x0 = sn->px0;
+	if (y0 < sn->py0) y0 = sn->py0;
+	if (x1 > sn->px0 + sn->pw) x1 = sn->px0 + sn->pw;
+	if (y1 > sn->py0 + sn->ph) y1 = sn->py0 + sn->ph;
+	for (py = y0; py < y1; py++)
+		memcpy(g_bits + (size_t)py * g_pw + x0,
+			sn->pixels + (size_t)(py - sn->py0) * sn->pw + (x0 - sn->px0), (size_t)(x1 - x0) * 4);
+	return TRUE;
 }
 
 // ---- images ----------------------------------------------------------------------------------
@@ -771,6 +1032,8 @@ static void __fastcall hk_blit_alpha(BYTE *dst, void *edx, int x, int y, BYTE *s
 	g_suppress++;
 	orig_blit_alpha(dst, edx, x, y, src, alpha);
 	g_suppress--;
+	if ((alpha & 0xFF) == 0xFF && restore_snapshot(dst, (short)x, (short)y, src))
+		return;
 	shadow_image(dst, (short)x, (short)y, src, alpha & 0xFF, TRUE);
 }
 
@@ -783,7 +1046,125 @@ static void __fastcall hk_blit_copy(BYTE *dst, void *edx, int x, int y, BYTE *sr
 	g_suppress++;
 	orig_blit_copy(dst, edx, x, y, src);
 	g_suppress--;
+	if (restore_snapshot(dst, (short)x, (short)y, src))
+		return;
 	shadow_image(dst, (short)x, (short)y, src, 0xFF, FALSE);
+}
+
+// ---- tiled fills -----------------------------------------------------------------------------
+
+// IMAGE_BASE::tile fills a rect by repeating a texture from the rect's top-left (box and panel
+// backgrounds). Replayed natively: bilinear with wrap-around, copy (mode 0) or alpha over (mode 1).
+// Solid textures make the game call fill_rect, which is already replayed.
+static int g_tcol_i0[8192], g_tcol_i1[8192], g_tcol_w[8192];
+
+typedef struct {
+	const DWORD *base;
+	int pitch, sw, sh, ay, x0, x1;
+	BOOL blend;
+} TILE_JOB;
+
+static int wrap(int v, int n)
+{
+	v %= n;
+	return v < 0 ? v + n : v;
+}
+
+static void tile_rows(void *ctx, int y0, int y1)
+{
+	const TILE_JOB *j = (const TILE_JOB *)ctx;
+	DWORD row[8192];
+	int py, k, n = j->x1 - j->x0;
+	for (py = y0; py < y1; py++) {
+		double f = (py + 0.5) / g_zy - 0.5 - j->ay;
+		int jj = (int)floor(f), wy = (int)((f - jj) * 256.0);
+		const DWORD *r0 = j->base + (size_t)wrap(jj, j->sh) * j->pitch;
+		const DWORD *r1 = j->base + (size_t)wrap(jj + 1, j->sh) * j->pitch;
+		for (k = 0; k < n; k++) {
+			DWORD a = r0[g_tcol_i0[k]], b = r0[g_tcol_i1[k]], c = r1[g_tcol_i0[k]], d = r1[g_tcol_i1[k]];
+			if (j->blend && ((a & b & c & d) >> 24) != 255) {
+				if (!((a | b | c | d) >> 24)) {
+					row[k] = 0;
+					continue;
+				}
+				a = premul(a); b = premul(b); c = premul(c); d = premul(d);
+			}
+			row[k] = bilerp(a, b, c, d, g_tcol_w[k], wy);
+		}
+		composite_row(g_bits + (size_t)py * g_pw + j->x0, row, n, j->blend, 255);
+	}
+}
+
+static void __fastcall hk_tile_image(BYTE *dst, void *edx, short *rect, BYTE *src, int mode)
+{
+	void **vt;
+	short pt[4], pitch;
+	int x0, y0, x1, y1, px, sw, sh, ax;
+	TILE_JOB j;
+
+	if (!g_on || dst != g_win || !src || !rect || (mode != 0 && mode != 1)) {
+		orig_tile_image(dst, edx, rect, src, mode);
+		return;
+	}
+	g_suppress++;
+	orig_tile_image(dst, edx, rect, src, mode);
+	g_suppress--;
+
+	vt = *(void ***)src;
+	sw = ((vf_short_t)vt[0x14 / 4])(src, NULL);
+	sh = ((vf_short_t)vt[0x18 / 4])(src, NULL);
+	if (sw <= 0 || sh <= 0 || ((vf_char_t)vt[0x20 / 4])(src, NULL)) // solid: fill_rect replayed it
+		return;
+	if (!map_rect(dst, rect, &x0, &y0, &x1, &y1) || x1 - x0 > 8192)
+		return;
+	pt[0] = *(short *)(src + SURF_ORIGIN);
+	pt[1] = *(short *)(src + SURF_ORIGIN + 2);
+	pt[2] = (short)sw;
+	pt[3] = (short)sh;
+	j.base = ((vf_pixel_ptr_t)vt[0x2C / 4])(src, NULL, pt, &pitch);
+	if (!j.base)
+		return;
+	j.pitch = pitch;
+	j.sw = sw;
+	j.sh = sh;
+	ax = rect[0] + *(short *)(dst + SURF_ORIGIN);
+	j.ay = rect[1] + *(short *)(dst + SURF_ORIGIN + 2);
+	j.x0 = x0;
+	j.x1 = x1;
+	j.blend = mode == 1;
+	for (px = x0; px < x1; px++) {
+		double f = (px + 0.5) / g_zx - 0.5 - ax;
+		int i = (int)floor(f);
+		g_tcol_i0[px - x0] = wrap(i, sw);
+		g_tcol_i1[px - x0] = wrap(i + 1, sw);
+		g_tcol_w[px - x0] = (int)((f - i) * 256.0);
+	}
+	parallel_rows(y0, y1, x1 - x0, tile_rows, &j);
+}
+
+// ---- lines -----------------------------------------------------------------------------------
+
+// The engine's Bresenham line (pitch markings, tactic arrows) locks the WHOLE surface for every
+// line, so the generic fallback would upscale the entire window per line - slow, and it overwrites
+// natively drawn hi-res text with blurry copies. Upscale just the line's bounding box instead.
+static void __fastcall hk_draw_line(BYTE *surf, void *edx, short *p0, short *p1, int a3, int a4,
+	int a5, int a6)
+{
+	int ox, oy, x0, y0, x1, y1;
+	if (!g_on || surf != g_win || !p0 || !p1) {
+		orig_draw_line(surf, edx, p0, p1, a3, a4, a5, a6);
+		return;
+	}
+	g_suppress++;
+	orig_draw_line(surf, edx, p0, p1, a3, a4, a5, a6);
+	g_suppress--;
+	ox = *(short *)(surf + SURF_ORIGIN);
+	oy = *(short *)(surf + SURF_ORIGIN + 2);
+	x0 = (p0[0] < p1[0] ? p0[0] : p1[0]) + ox - 1;
+	x1 = (p0[0] > p1[0] ? p0[0] : p1[0]) + ox + 2;
+	y0 = (p0[1] < p1[1] ? p0[1] : p1[1]) + oy - 1;
+	y1 = (p0[1] > p1[1] ? p0[1] : p1[1]) + oy + 2;
+	upscale(x0, y0, x1 - x0, y1 - y0);
 }
 
 // ---- present ---------------------------------------------------------------------------------
@@ -816,17 +1197,25 @@ static BOOL patch_vtable_slot(DWORD vt, int slot, DWORD expect, void *fn)
 	return TRUE;
 }
 
-BOOL hires_install(void (*log)(const char *fmt, ...), BOOL smooth)
+BOOL hires_install(void (*log)(const char *fmt, ...), BOOL smooth, BOOL enable)
 {
 	int i;
 	logf_ = log;
 	g_smooth = smooth;
+	g_brand_inner.len = (WORD)(sizeof g_brand_chars / 2 - 1);
+	g_brand_inner.chars = g_brand_chars;
+	g_brand.inner = &g_brand_inner;
+
 	if (!hook_verify(ADDR_DRAW_STRING, SIG_DRAW_STRING, sizeof SIG_DRAW_STRING) ||
 		!hook_verify(ADDR_SET_FONT_SIZE, SIG_SET_FONT_SIZE, sizeof SIG_SET_FONT_SIZE) ||
+		!hook_verify(ADDR_MEASURE_STRING, SIG_MEASURE_STRING, sizeof SIG_MEASURE_STRING) ||
 		!hook_verify(ADDR_T2K_SET_TRANSFORM, SIG_T2K_SET_TRANSFORM, sizeof SIG_T2K_SET_TRANSFORM) ||
 		!hook_verify(ADDR_FILL_RECT, SIG_FILL_RECT, sizeof SIG_FILL_RECT) ||
 		!hook_verify(ADDR_BLIT_ALPHA, SIG_BLIT_ALPHA, sizeof SIG_BLIT_ALPHA) ||
 		!hook_verify(ADDR_BLIT_COPY, SIG_BLIT_COPY, sizeof SIG_BLIT_COPY) ||
+		!hook_verify(ADDR_DRAW_LINE, SIG_DRAW_LINE, sizeof SIG_DRAW_LINE) ||
+		!hook_verify(ADDR_TILE_IMAGE, SIG_TILE_IMAGE, sizeof SIG_TILE_IMAGE) ||
+		!hook_verify(ADDR_SNAPSHOT, SIG_SNAPSHOT, sizeof SIG_SNAPSHOT) ||
 		*(DWORD *)(VT_WINDOW_PLATFORM + VT_SLOT_LOCK_RECT) != ADDR_WIN_LOCK_RECT ||
 		*(DWORD *)(VT_WINDOW_PLATFORM + VT_SLOT_UNLOCK) != ADDR_SHARED_RET) {
 		log("hires: signature mismatch; hi-res rendering disabled");
@@ -844,17 +1233,21 @@ BOOL hires_install(void (*log)(const char *fmt, ...), BOOL smooth)
 	g_proxy.vt2 = g_proxy_vt;
 
 	if (!hook_install(ADDR_DRAW_STRING, (void *)hk_draw_string, 6, (void **)&orig_draw_string) ||
+		!hook_install(ADDR_MEASURE_STRING, (void *)hk_measure_string, 5, (void **)&orig_measure_string) ||
 		!hook_install(ADDR_T2K_SET_TRANSFORM, (void *)hk_t2k_set_transform, 6,
 			(void **)&orig_t2k_set_transform) ||
 		!hook_install(ADDR_FILL_RECT, (void *)hk_fill_rect, 7, (void **)&orig_fill_rect) ||
 		!hook_install(ADDR_BLIT_ALPHA, (void *)hk_blit_alpha, 5, (void **)&orig_blit_alpha) ||
 		!hook_install(ADDR_BLIT_COPY, (void *)hk_blit_copy, 5, (void **)&orig_blit_copy) ||
+		!hook_install(ADDR_DRAW_LINE, (void *)hk_draw_line, 7, (void **)&orig_draw_line) ||
+		!hook_install(ADDR_TILE_IMAGE, (void *)hk_tile_image, 8, (void **)&orig_tile_image) ||
+		!hook_install(ADDR_SNAPSHOT, (void *)hk_snapshot, 7, (void **)&orig_snapshot) ||
 		!patch_vtable_slot(VT_WINDOW_PLATFORM, VT_SLOT_LOCK_RECT, ADDR_WIN_LOCK_RECT, (void *)hk_win_lock_rect) ||
 		!patch_vtable_slot(VT_WINDOW_PLATFORM, VT_SLOT_UNLOCK, ADDR_SHARED_RET, (void *)hk_win_unlock)) {
 		log("hires: install failed");
 		return FALSE;
 	}
-	g_installed = TRUE;
+	g_installed = enable; // hooks always on (branding); the shadow buffer only if enabled
 	log("hires: installed (text, fills, images native; rest upscaled %s)", smooth ? "bilinear" : "nearest");
 	return TRUE;
 }
@@ -890,6 +1283,8 @@ static BOOL write_bmp(const WCHAR *path, const DWORD *bits, int w, int h, int pi
 
 BOOL hires_dump(const WCHAR *path, BYTE *win)
 {
+	diag_dump("fallback upscales since last capture", g_diag_fallback);
+	diag_dump("text drawn off-window since last capture", g_diag_text);
 	if (g_on) {
 		// also the game's own logical frame, to tell replay bugs from game behaviour
 		WCHAR logical[MAX_PATH];

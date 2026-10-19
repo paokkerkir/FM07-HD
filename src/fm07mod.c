@@ -601,8 +601,7 @@ static void install_all(void)
 	install("main_wndproc", ADDR_MAIN_WNDPROC, SIG_MAIN_WNDPROC, sizeof SIG_MAIN_WNDPROC,
 		(void *)hk_main_wndproc, 5, (void **)&orig_main_wndproc);
 	install("present", ADDR_PRESENT, SIG_PRESENT, sizeof SIG_PRESENT, (void *)hk_present, 5, NULL);
-	if (cfg.hires)
-		hires_install(modlog, cfg.smooth);
+	hires_install(modlog, cfg.smooth, cfg.hires);
 	if (cfg.fast_file_io)
 		perf_install(modlog);
 	if (!cfg.exclusive_fullscreen) {
@@ -615,7 +614,7 @@ static void install_all(void)
 // Marker export (see fm07mod.def): lets fm07launch.exe recognise a dsound.dll that is this mod.
 DWORD fm07mod_version(void)
 {
-	return 0x00010000;
+	return 0x00010002; // 1.2
 }
 
 // True only inside the exact fm.exe build all addresses were taken from.
