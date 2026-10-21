@@ -11,12 +11,16 @@ untouched.
 <img width="2558" height="1439" alt="image" src="https://github.com/user-attachments/assets/7c892c1f-63b3-4026-b2c6-074db196ca98" />
 
 
+## Download
+
+**[⬇️ Download Latest Release](../../releases/latest)**
+
 ## Install
 
-Copy **`dsound.dll`** and **`fm07mod.ini`** into the Football Manager 2007 folder (next to
-`fm.exe`). Start the game as usual — shortcut, double-click, anything. No launcher needed.
+Extract all files into the Football Manager 2007 folder (next to
+fm.exe). Start the game as usual.
 
-To uninstall, delete `dsound.dll` (and `fm07mod.ini`).
+To uninstall, delete `dsound.dll` (and `fm07mod.ini`), and revert the old intro.xml.
 
 ## Optional: match banner fix for large windows
 
