@@ -6,6 +6,11 @@ fullscreen, and UI scaling zoom up to 4x with text, boxes and images drawn sharp
 Requires fm.exe **7.0.2** (the latest official patch). Any other version is detected and left
 untouched.
 
+## Screenshots
+<img width="534" height="86" alt="image" src="https://github.com/user-attachments/assets/4d1b8939-a58a-4305-bba7-b20c1f2f7372" />
+<img width="2558" height="1439" alt="image" src="https://github.com/user-attachments/assets/7c892c1f-63b3-4026-b2c6-074db196ca98" />
+
+
 ## Install
 
 Copy **`dsound.dll`** and **`fm07mod.ini`** into the Football Manager 2007 folder (next to
